@@ -1233,7 +1233,9 @@
   // 数据全部保存在浏览器本地 localStorage（纯前端 PWA 方案，无后端）
   const NEW_KEY = 'todo-tasks-v2';
   const OLD_KEY = 'todo-tasks';
+  const DELETED_KEY = 'todo-deleted-v1';   // 已删除任务的 id 与删除时间，用于多设备同步时传播删除
   let tasks = JSON.parse(localStorage.getItem(NEW_KEY) || '[]');
+  let deletedMap = JSON.parse(localStorage.getItem(DELETED_KEY) || '{}');
   
   // 兼容老版本：启动时如果新 key 没数据，就从旧 key 读过来迁过去
   if (tasks.length === 0) {
@@ -1245,13 +1247,24 @@
     }
   }
   
-  // 给旧任务补齐新字段（id、priority 等），防止后续代码出错
+  // 给旧任务补齐新字段（id、priority、updatedAt 等），防止后续代码出错
   tasks.forEach((t, i) => {
     if (!t.id) t.id = Date.now() + '-' + i + '-' + Math.random().toString(36).slice(2, 7);
     if (!t.priority) t.priority = '';
     if (!t.category) t.category = '';
     if (t.pinned === undefined) t.pinned = false;
+    if (!t.updatedAt) t.updatedAt = t.createdAt || t.doneAt || 0;
   });
+
+  // 清除超过 30 天的删除记录，防止无限增长
+  (function pruneDeleted() {
+    const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+    let changed = false;
+    for (const id of Object.keys(deletedMap)) {
+      if (deletedMap[id] < cutoff) { delete deletedMap[id]; changed = true; }
+    }
+    if (changed) localStorage.setItem(DELETED_KEY, JSON.stringify(deletedMap));
+  })();
 
   // 显示今天的日期，待办日期默认就是今天
 
@@ -1310,6 +1323,7 @@
 
   function save() {
     localStorage.setItem(NEW_KEY, JSON.stringify(tasks));
+    localStorage.setItem(DELETED_KEY, JSON.stringify(deletedMap));
     // 有配置云端同步时，延迟 2 秒自动推送（避免频繁请求）
     if (typeof schedulePush === 'function') schedulePush();
   }
@@ -1325,18 +1339,20 @@
   function addTask() {
     const text = input.value.trim();
     if (!text) return;
+    const stamp = Date.now();
     tasks.unshift({
-      id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+      id: stamp + '-' + Math.random().toString(36).slice(2, 7),
       text: text,
       done: false,
       date: dateInput.value || '',
       doneDate: '',
-      createdAt: Date.now(),
+      createdAt: stamp,
       doneAt: null,
       note: '',
       priority: currentOpt.priority,
       category: currentOpt.category,
-      pinned: false
+      pinned: false,
+      updatedAt: stamp
     });
     input.value = '';
     dateInput.value = toISO(new Date());
@@ -1355,11 +1371,14 @@
       tasks[index].doneAt = null;
       tasks[index].doneDate = '';
     }
+    tasks[index].updatedAt = Date.now();
     save();
     render();
   }
 
   function deleteTask(index) {
+    const id = tasks[index].id;
+    if (id) deletedMap[id] = Date.now();   // 记录删除，同步时传到其他设备
     tasks.splice(index, 1);
     editingNoteIndex = null;
     editingTextIndex = null;
@@ -1369,12 +1388,17 @@
 
   function togglePin(index) {
     tasks[index].pinned = !tasks[index].pinned;
+    tasks[index].updatedAt = Date.now();
     save();
     render();
   }
 
   function clearDone() {
     if (!confirm('确定清除所有已完成的任务吗？')) return;
+    const nowTs = Date.now();
+    tasks.filter(t => t.done).forEach(t => {
+      if (t.id) deletedMap[t.id] = nowTs;
+    });
     tasks = tasks.filter(t => !t.done);
     editingNoteIndex = null;
     editingTextIndex = null;
@@ -1418,6 +1442,7 @@
   // 备注输入时保存（不重渲染，防止失焦）
   function saveNote(index, value) {
     tasks[index].note = value;
+    tasks[index].updatedAt = Date.now();
     save();
   }
 
@@ -1438,15 +1463,24 @@
   // 完成编辑任务文字
   function finishEditTask(index, value) {
     const t = value.trim();
-    if (t) tasks[index].text = t;
+    if (t && t !== tasks[index].text) {
+      tasks[index].text = t;
+      tasks[index].updatedAt = Date.now();
+    }
     editingTextIndex = null;
     save();
     render();
   }
 
-  // 导出为 JSON 备份文件
+  // 导出为 JSON 备份文件（含删除记录，便于完整恢复）
   function exportTasks() {
-    const data = JSON.stringify(tasks, null, 2);
+    const payload = {
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      tasks: tasks,
+      deleted: deletedMap
+    };
+    const data = JSON.stringify(payload, null, 2);
     const blob = new Blob([data], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1456,20 +1490,37 @@
     URL.revokeObjectURL(url);
   }
 
-  // 从 JSON 文件恢复
+  // 从 JSON 文件恢复（兼容旧版纯数组格式）
   function importTasks(event) {
     const file = event.target.files[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = function(e) {
       try {
-        const imported = JSON.parse(e.target.result);
-        if (!Array.isArray(imported)) throw new Error('格式错误');
+        const parsed = JSON.parse(e.target.result);
+        let importedTasks, importedDeleted;
+        if (Array.isArray(parsed)) {
+          // 旧格式：直接是任务数组
+          importedTasks = parsed;
+          importedDeleted = {};
+        } else if (parsed && Array.isArray(parsed.tasks)) {
+          importedTasks = parsed.tasks;
+          importedDeleted = parsed.deleted || {};
+        } else {
+          throw new Error('格式错误');
+        }
         if (confirm('导入会覆盖当前所有任务，确定继续吗？')) {
-          tasks = imported;
+          tasks = importedTasks;
+          deletedMap = importedDeleted;
+          tasks.forEach((t, i) => {
+            if (!t.id) t.id = Date.now() + '-' + i + '-' + Math.random().toString(36).slice(2, 7);
+            if (t.pinned === undefined) t.pinned = false;
+            if (t.note === undefined) t.note = '';
+            if (!t.updatedAt) t.updatedAt = t.createdAt || t.doneAt || Date.now();
+          });
           save();
           render();
-          alert('导入成功！');
+          alert('导入成功！共 ' + tasks.length + ' 条任务');
         }
       } catch (err) {
         alert('导入失败：文件格式不正确');
@@ -1674,6 +1725,7 @@
   async function createGist() {
     const payload = {
       tasks: tasks,
+      deleted: deletedMap,
       updatedAt: Date.now(),
       device: getSyncConfig().device || detectDeviceName()
     };
@@ -1699,12 +1751,56 @@
     return JSON.parse(file.content);
   }
 
+  // 逐条合并本地与云端数据（避免整份覆盖导致丢数据）
+  // 规则：同一 id 取 updatedAt 较新的；删除记录取并集；最后剔除已删除任务
+  function mergeRemote(localTasks, localDeleted, remote) {
+    const remoteTasks = Array.isArray(remote.tasks) ? remote.tasks : [];
+    const remoteDeleted = (remote.deleted && typeof remote.deleted === 'object') ? remote.deleted : {};
+
+    // 1. 合并删除记录
+    const mergedDeleted = { ...localDeleted };
+    Object.keys(remoteDeleted).forEach(id => {
+      if (!mergedDeleted[id] || remoteDeleted[id] > mergedDeleted[id]) {
+        mergedDeleted[id] = remoteDeleted[id];
+      }
+    });
+
+    // 2. 合并任务：按 id 取更新时间较新的版本
+    const map = new Map();
+    localTasks.forEach(t => { if (t && t.id) map.set(t.id, t); });
+    remoteTasks.forEach(t => {
+      if (!t || !t.id) return;
+      const cur = map.get(t.id);
+      if (!cur || (t.updatedAt || 0) > (cur.updatedAt || 0)) {
+        map.set(t.id, t);
+      }
+    });
+
+    // 3. 补齐字段并剔除已删除
+    const mergedTasks = [];
+    map.forEach(t => {
+      if (mergedDeleted[t.id]) return;   // 已删除的不再展示
+      if (!t.priority) t.priority = '';
+      if (!t.category) t.category = '';
+      if (t.pinned === undefined) t.pinned = false;
+      if (t.note === undefined) t.note = '';
+      if (!t.updatedAt) t.updatedAt = t.createdAt || t.doneAt || 0;
+      mergedTasks.push(t);
+    });
+
+    // 新任务排前面
+    mergedTasks.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    return { tasks: mergedTasks, deleted: mergedDeleted };
+  }
+
   // 推送到 Gist
   async function pushToGist() {
     const { gistId } = getSyncConfig();
     if (!gistId) return;
     const payload = {
       tasks: tasks,
+      deleted: deletedMap,
       updatedAt: Date.now(),
       device: getSyncConfig().device || detectDeviceName()
     };
@@ -1716,25 +1812,16 @@
     localStorage.setItem(SYNC_LAST_UPDATE_KEY, String(payload.updatedAt));
   }
 
-  // 立即推送（debounce 防止频繁请求）
+  // 本地改动后延迟同步（先拉取合并再推送，避免覆盖其他设备的改动）
   function schedulePush() {
     if (!isSyncEnabled() || inApplyingRemote) return;
-    localStorage.setItem(SYNC_LAST_UPDATE_KEY, String(Date.now()));
     clearTimeout(pushTimer);
     pushTimer = setTimeout(async () => {
-      try {
-        updateSyncStatus('syncing', '同步中…');
-        await pushToGist();
-        updateSyncStatus('ok', '已同步');
-        updateSyncStatusBox('ok', '✅ 数据已同步到云端', '本设备：' + (getSyncConfig().device || detectDeviceName()) + '<br>时间：' + new Date().toLocaleString('zh-CN'));
-      } catch (err) {
-        updateSyncStatus('error', '同步失败');
-        updateSyncStatusBox('error', '❌ 同步失败', err.message);
-      }
+      await syncNow(false);
     }, 2000);
   }
 
-  // 完整同步：比较时间戳，决定拉取还是推送
+  // 完整同步：拉取云端 → 逐条合并 → 回写云端（多设备不会互相覆盖）
   async function syncNow(showAlert) {
     if (!isSyncEnabled()) {
       if (showAlert) alert('请先填写 Token 并保存');
@@ -1746,38 +1833,39 @@
     try {
       updateSyncStatus('syncing', '同步中…');
       const remote = await pullFromGist();
-      const localUpdatedAt = Number(localStorage.getItem(SYNC_LAST_UPDATE_KEY) || 0);
 
       if (!remote) {
         // 云端没有数据，推送本地
         await pushToGist();
         updateSyncStatus('ok', '已同步');
-        updateSyncStatusBox('ok', '✅ 已上传本机数据到云端', '设备：' + (getSyncConfig().device || detectDeviceName()));
-      } else if (remote.updatedAt > localUpdatedAt && Array.isArray(remote.tasks)) {
-        // 云端更新，拉到本地
-        inApplyingRemote = true;
-        tasks = remote.tasks;
-        tasks.forEach((t, i) => {
-          if (!t.id) t.id = Date.now() + '-' + i + '-' + Math.random().toString(36).slice(2, 7);
-          if (t.pinned === undefined) t.pinned = false;
-          if (t.note === undefined) t.note = '';
-        });
-        localStorage.setItem(NEW_KEY, JSON.stringify(tasks));
-        localStorage.setItem(SYNC_LAST_UPDATE_KEY, String(remote.updatedAt));
-        inApplyingRemote = false;
-        render();
-        updateSyncStatus('ok', '已同步');
-        updateSyncStatusBox('ok', '✅ 已从云端拉取最新数据',
-          '来源设备：' + (remote.device || '未知') +
-          '<br>云端时间：' + new Date(remote.updatedAt).toLocaleString('zh-CN') +
-          '<br>任务数：' + tasks.length);
-      } else {
-        // 本地更新或时间相同，推送本地
-        await pushToGist();
-        updateSyncStatus('ok', '已同步');
-        updateSyncStatusBox('ok', '✅ 已上传本机最新数据到云端',
+        updateSyncStatusBox('ok', '✅ 已上传本机数据到云端',
           '设备：' + (getSyncConfig().device || detectDeviceName()) +
           '<br>任务数：' + tasks.length);
+      } else {
+        // 合并本地与云端（逐条比对更新时间，取较新的版本）
+        const before = tasks.length;
+        const merged = mergeRemote(tasks, deletedMap, remote);
+        const changed = JSON.stringify(merged.tasks) !== JSON.stringify(tasks) ||
+                        JSON.stringify(merged.deleted) !== JSON.stringify(deletedMap);
+
+        inApplyingRemote = true;
+        tasks = merged.tasks;
+        deletedMap = merged.deleted;
+        localStorage.setItem(NEW_KEY, JSON.stringify(tasks));
+        localStorage.setItem(DELETED_KEY, JSON.stringify(deletedMap));
+        inApplyingRemote = false;
+
+        // 合并结果回写云端，保证所有设备最终一致
+        await pushToGist();
+        localStorage.setItem(SYNC_LAST_UPDATE_KEY, String(Date.now()));
+        render();
+
+        updateSyncStatus('ok', '已同步');
+        updateSyncStatusBox('ok', '✅ 同步完成（已逐条合并）',
+          '本机任务：' + before + ' → ' + tasks.length +
+          '<br>来源设备：' + (remote.device || '未知') +
+          '<br>云端更新：' + new Date(remote.updatedAt).toLocaleString('zh-CN') +
+          (changed ? '<br>📥 已应用云端变更' : '<br>两边一致，无变化'));
       }
 
       if (showAlert) {
@@ -2117,6 +2205,16 @@
   if (isSyncEnabled()) {
     updateSyncStatus('syncing', '检查中…');
     setTimeout(() => syncNow(false), 600);
+
+    // 每 60 秒自动同步一次，及时拿到其他设备的改动
+    setInterval(() => {
+      if (!document.hidden && !isSyncing) syncNow(false);
+    }, 60000);
+
+    // 切回页面时立即同步一次
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && !isSyncing) syncNow(false);
+    });
   }
 </script>
 </body>
